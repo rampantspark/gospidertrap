@@ -17,7 +17,7 @@ const (
 	linksPerPageMax   = 10
 	lengthOfLinksMin  = 3
 	lengthOfLinksMax  = 20
-	port              = ":8000"
+	defaultPort       = "8000"
 	delayMilliseconds = 350
 	charSpace         = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890_-/"
 )
@@ -25,6 +25,7 @@ const (
 var (
 	webpages []string
 	chars    = []rune(charSpace)
+	port     string
 )
 
 func init() {
@@ -63,13 +64,20 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 }
 
 func printUsage() {
-	fmt.Println("Usage:", os.Args[0], "[-a HTML_FILE]\n")
-	fmt.Println("HTML_FILE is an HTML file containing links to be replaced with random ones.")
+	fmt.Println("Usage:", os.Args[0], "[-p PORT] [-a HTML_FILE] [-w WORDLIST_FILE] [-e ENDPOINT]")
+	fmt.Println()
+	fmt.Println("-p   Port to run the server on (default: 8000) (optional)")
+	fmt.Println("-a   HTML file input, replace <a href> links (optional)")
+	fmt.Println("-e   Endpoint to point form GET requests to (optional)")
+	fmt.Println("-w   Wordlist to use for links (optional)")
 }
 
 func main() {
 	var htmlFile string
+
+	flag.StringVar(&port, "p", defaultPort, "Port to run the server on")
 	flag.StringVar(&htmlFile, "a", "", "HTML file containing links to be replaced")
+	flag.Usage = printUsage
 	flag.Parse()
 
 	if htmlFile != "" {
@@ -110,7 +118,7 @@ func main() {
 
 	http.HandleFunc("/", handleRequest)
 	fmt.Println("Starting server on port", port, "...")
-	err := http.ListenAndServe(port, nil)
+	err := http.ListenAndServe(":"+port, nil)
 	if err != nil {
 		fmt.Println("Error starting HTTP server on port", port+".", err)
 	}
