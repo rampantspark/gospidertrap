@@ -26,6 +26,7 @@ var (
 	webpages []string
 	chars    = []rune(charSpace)
 	port     string
+	endpoint string
 )
 
 func init() {
@@ -44,6 +45,12 @@ func generatePage() string {
 			address = randString(rand.Intn(lengthOfLinksMax-lengthOfLinksMin+1) + lengthOfLinksMin)
 		}
 		html += "<a href=\"" + address + "\">" + address + "</a><br>\n"
+	}
+	if endpoint != "" {
+		html += `<form action="` + endpoint + `" method="get">
+		<input type="text" name="param">
+		<button type="submit">Submit</button>
+		</form>`
 	}
 	html += "</body>\n</html>"
 	return html
@@ -64,33 +71,36 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 }
 
 func printUsage() {
-	fmt.Println("Usage:", os.Args[0], "[-p PORT] [-a HTML_FILE] [-w WORDLIST_FILE] [-e ENDPOINT]")
+	fmt.Println("Usage:", os.Args[0], "[-p PORT] -a HTML_FILE -w WORDLIST_FILE [-e ENDPOINT]")
 	fmt.Println()
-	fmt.Println("-p   Port to run the server on (default: 8000) (optional)")
-	fmt.Println("-a   HTML file input, replace <a href> links (optional)")
+	fmt.Println("-p   Port to run the server on (default: 8000)")
+	fmt.Println("-a   HTML file input, replace <a href> links")
 	fmt.Println("-e   Endpoint to point form GET requests to (optional)")
-	fmt.Println("-w   Wordlist to use for links (optional)")
+	fmt.Println("-w   Wordlist to use for links")
 }
 
 func main() {
 	var htmlFile string
+	var wordlistFile string
 
 	flag.StringVar(&port, "p", defaultPort, "Port to run the server on")
 	flag.StringVar(&htmlFile, "a", "", "HTML file containing links to be replaced")
+	flag.StringVar(&wordlistFile, "w", "", "Wordlist file to use for links")
+	flag.StringVar(&endpoint, "e", "", "Endpoint to point form GET requests to")
 	flag.Usage = printUsage
 	flag.Parse()
 
-	if htmlFile != "" {
-		file, err := os.Open(htmlFile)
+	if wordlistFile != "" {
+		file, err := os.Open(wordlistFile)
 		if err != nil {
-			fmt.Println("Can't read input file. Using randomly generated links.")
+			fmt.Println("Can't read wordlist file. Using randomly generated links.")
 		} else {
 			defer file.Close()
 			buf := make([]byte, 1024)
 			for {
 				n, err := file.Read(buf)
 				if err != nil && err != io.EOF {
-					fmt.Println("Error reading input file.")
+					fmt.Println("Error reading wordlist file.")
 					break
 				}
 				if n == 0 {
@@ -99,19 +109,14 @@ func main() {
 				content := string(buf[:n])
 				lines := strings.Split(content, "\n")
 				for _, line := range lines {
-					if strings.Contains(line, "<a href=\"") {
-						// Extract link from <a href=""> tag
-						linkStart := strings.Index(line, "<a href=\"") + len("<a href=\"")
-						linkEnd := strings.Index(line[linkStart:], "\"") + linkStart
-						if linkStart >= len("<a href=\"") && linkEnd > linkStart {
-							link := line[linkStart:linkEnd]
-							webpages = append(webpages, link)
-						}
+					line = strings.TrimSpace(line)
+					if line != "" {
+						webpages = append(webpages, line)
 					}
 				}
 			}
 			if len(webpages) == 0 {
-				fmt.Println("No links found in the HTML file. Using randomly generated links.")
+				fmt.Println("No links found in the wordlist file. Using randomly generated links.")
 			}
 		}
 	}
