@@ -1,0 +1,93 @@
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v2
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.19'  # Specify the version you need
+
+    - name: Verify Go installation
+      run: go version
+
+    - name: Install dependencies
+      run: go mod download
+
+    - name: Build for Windows
+      run: GOOS=windows GOARCH=amd64 go build -o myapp_windows_amd64.exe
+
+    - name: Build for macOS
+      run: GOOS=darwin GOARCH=amd64 go build -o myapp_darwin_amd64
+
+    - name: Build for Linux
+      run: GOOS=linux GOARCH=amd64 go build -o myapp_linux_amd64
+
+    - name: Archive builds
+      uses: actions/upload-artifact@v2
+      with:
+        name: myapp-builds
+        path: |
+          myapp_windows_amd64.exe
+          myapp_darwin_amd64
+          myapp_linux_amd64
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Download builds
+      uses: actions/download-artifact@v2
+      with:
+        name: myapp-builds
+
+    - name: Get latest tag
+      id: get_tag
+      run: echo "::set-output name=tag::$(git describe --abbrev=0 --tags)"
+
+    - name: Calculate new version
+      id: bump_version
+      run: |
+        NEW_VERSION=$(echo ${{ steps.get_tag.outputs.tag }} | awk -F. -v OFS=. '{$NF += 1 ; print}')
+        echo "::set-output name=version::$NEW_VERSION"
+
+    - name: Create release
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ steps.bump_version.outputs.version }}
+        release_name: Release ${{ steps.bump_version.outputs.version }}
+        body: |
+          Release notes for version ${{ steps.bump_version.outputs.version }}
+        draft: false
+        prerelease: false
+
+    - name: Upload builds to release
+      id: upload-release-asset
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: |
+          myapp_windows_amd64.exe
+          myapp_darwin_amd64
+          myapp_linux_amd64
+        asset_name: |
+          myapp_windows_amd64.exe
+          myapp_darwin_amd64
+          myapp_linux_amd64
+        asset_content_type: application/octet-stream
