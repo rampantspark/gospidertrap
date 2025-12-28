@@ -14,17 +14,22 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"html"
 	"io"
+	"log/slog"
 	"math/rand"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -53,7 +58,63 @@ const (
 	writeTimeoutSeconds    = 15
 	idleTimeoutSeconds     = 60
 	shutdownTimeoutSeconds = 5
+
+	// Length of random admin endpoint path
+	adminPathLength = 32
+	// Length of admin authentication token
+	adminTokenLength = 32
+
+	// Input validation limits
+	maxHTMLTemplateSize = 10 * 1024 * 1024 // 10 MB
+	maxWordlistFileSize = 50 * 1024 * 1024 // 50 MB
+	maxWordlistEntries  = 100000           // Maximum number of wordlist entries
+
+	// Persistence settings
+	defaultDataDir        = "data"
+	statsSaveInterval     = 5 * time.Minute // Save stats every 5 minutes
+	requestsLogFileName   = "requests.ndjson"
+	statsFileName         = "stats.json"
+
+	// Admin UI display settings
+	maxRecentRequestsDisplay    = 50  // Maximum number of recent requests to display in admin UI
+	maxUserAgentDisplayLength   = 50  // Maximum length of user agent to display
+	maxUserAgentTruncateLength  = 47  // Length to truncate user agent to (with "...")
+	topItemsDisplayCount        = 10  // Number of top items to display in charts and tables
+
+	// Cookie settings for admin authentication
+	adminCookieName   = "gospidertrap_admin_token"
+	adminCookieMaxAge = 86400 // 24 hours in seconds
 )
+
+// RequestInfo holds information about a single request.
+type RequestInfo struct {
+	IP        string    // Client IP address
+	UserAgent string    // Client User-Agent header
+	Path      string    // Requested path
+	Timestamp time.Time // Request timestamp
+}
+
+// Stats holds connection statistics and request information.
+type Stats struct {
+	mu                sync.RWMutex              // Mutex for thread-safe access
+	StartTime         time.Time                 // Server start time
+	TotalRequests     int                       // Total number of requests
+	IPCounts          map[string]int            // Request count per IP address
+	UserAgents        map[string]int            // Request count per user agent
+	RecentRequests    []RequestInfo             // Recent request history (limited size)
+	MaxRecentRequests int                       // Maximum number of recent requests to keep
+}
+
+// newStats creates and initializes a new Stats instance.
+func newStats() *Stats {
+	return &Stats{
+		StartTime:         time.Now(),
+		IPCounts:          make(map[string]int),
+		UserAgents:        make(map[string]int),
+		RecentRequests:    make([]RequestInfo, 0),
+		MaxRecentRequests: 100, // Keep last 100 requests
+	}
+}
 
 // Config holds the application configuration and state.
 // It manages wordlists, HTML templates, server settings, and random number generation.
@@ -64,14 +125,32 @@ type Config struct {
 	endpoint     string      // Form submission endpoint (optional)
 	htmlTemplate string      // HTML template file content (optional)
 	rand         *rand.Rand  // Random number generator instance
+	stats        *Stats      // Statistics tracking instance
+	adminPath    string      // Random admin UI endpoint path
+	adminToken   string      // Authentication token for admin UI
+	dataDir      string      // Directory for persisting data files
+	logFile      *os.File    // File handle for NDJSON request log
+	logFileMu    sync.Mutex  // Mutex for thread-safe log file writes
+	logger       *slog.Logger // Structured logger instance
+	saveCtx      context.Context    // Context for periodic stats saving
+	saveCancel   context.CancelFunc // Cancel function for periodic stats saving
 }
 
 // newConfig creates and initializes a new Config instance with default values.
-// It initializes the random number generator with a time-based seed.
+// It initializes the random number generator with a time-based seed and sets up structured logging.
 func newConfig() *Config {
+	ctx, cancel := context.WithCancel(context.Background())
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
 	return &Config{
-		chars: []rune(charSpace),
-		rand:  rand.New(rand.NewSource(time.Now().UnixNano())),
+		chars:       []rune(charSpace),
+		rand:        rand.New(rand.NewSource(time.Now().UnixNano())),
+		stats:       newStats(),
+		dataDir:    defaultDataDir,
+		logger:     logger,
+		saveCtx:    ctx,
+		saveCancel: cancel,
 	}
 }
 
@@ -221,18 +300,779 @@ func (cfg *Config) randString(length int) string {
 	return string(b)
 }
 
+// generateAdminPath generates a random admin endpoint path.
+//
+// Returns a random path string starting with "/" for the admin UI.
+func (cfg *Config) generateAdminPath() string {
+	return "/" + cfg.randString(adminPathLength)
+}
+
+// generateAdminToken generates a random authentication token for the admin UI.
+//
+// Returns a random token string.
+func (cfg *Config) generateAdminToken() string {
+	return cfg.randString(adminTokenLength)
+}
+
+// validateAdminToken checks if the provided token matches the admin token.
+//
+// Parameters:
+//   - token: the token to validate
+//
+// Returns true if the token is valid, false otherwise.
+func (cfg *Config) validateAdminToken(token string) bool {
+	return token == cfg.adminToken
+}
+
+// getAdminTokenFromRequest extracts the admin token from either cookie or query parameter.
+//
+// For backward compatibility, it checks query parameters first, then cookies.
+//
+// Parameters:
+//   - r: the HTTP request
+//
+// Returns the token if found, empty string otherwise.
+func (cfg *Config) getAdminTokenFromRequest(r *http.Request) string {
+	// Check cookie first (preferred method)
+	if cookie, err := r.Cookie(adminCookieName); err == nil {
+		return cookie.Value
+	}
+	// Fallback to query parameter for backward compatibility
+	return r.URL.Query().Get("token")
+}
+
+// setAdminCookie sets the admin authentication cookie.
+//
+// Parameters:
+//   - w: the HTTP response writer
+func (cfg *Config) setAdminCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     adminCookieName,
+		Value:    cfg.adminToken,
+		Path:     "/",
+		MaxAge:   adminCookieMaxAge,
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+		Secure:   false, // Set to true if using HTTPS
+	})
+}
+
+// isAuthenticated checks if the request is authenticated with a valid admin token.
+//
+// Parameters:
+//   - r: the HTTP request
+//
+// Returns true if authenticated, false otherwise.
+func (cfg *Config) isAuthenticated(r *http.Request) bool {
+	token := cfg.getAdminTokenFromRequest(r)
+	return cfg.validateAdminToken(token)
+}
+
+// ChartData holds data for rendering charts.
+type ChartData struct {
+	TopIPs struct {
+		Labels []string `json:"labels"`
+		Data   []int    `json:"data"`
+	} `json:"topIPs"`
+	TopUserAgents struct {
+		Labels []string `json:"labels"`
+		Data   []int    `json:"data"`
+	} `json:"topUserAgents"`
+}
+
+// getChartData retrieves chart data from statistics.
+//
+// Returns chart data including top IPs and top user agents.
+func (cfg *Config) getChartData() ChartData {
+	cfg.stats.mu.RLock()
+	defer cfg.stats.mu.RUnlock()
+
+	var data ChartData
+
+	// Top IPs (top 10)
+	type ipCount struct {
+		ip    string
+		count int
+	}
+	ipList := make([]ipCount, 0, len(cfg.stats.IPCounts))
+	for ip, count := range cfg.stats.IPCounts {
+		ipList = append(ipList, ipCount{ip: ip, count: count})
+	}
+	sort.Slice(ipList, func(i, j int) bool {
+		return ipList[i].count > ipList[j].count
+	})
+	maxIPs := topItemsDisplayCount
+	if len(ipList) < maxIPs {
+		maxIPs = len(ipList)
+	}
+	for i := 0; i < maxIPs; i++ {
+		data.TopIPs.Labels = append(data.TopIPs.Labels, ipList[i].ip)
+		data.TopIPs.Data = append(data.TopIPs.Data, ipList[i].count)
+	}
+
+	// Top User Agents
+	type uaCount struct {
+		ua    string
+		count int
+	}
+	uaList := make([]uaCount, 0, len(cfg.stats.UserAgents))
+	for ua, count := range cfg.stats.UserAgents {
+		uaList = append(uaList, uaCount{ua: ua, count: count})
+	}
+	sort.Slice(uaList, func(i, j int) bool {
+		return uaList[i].count > uaList[j].count
+	})
+	maxUAs := topItemsDisplayCount
+	if len(uaList) < maxUAs {
+		maxUAs = len(uaList)
+	}
+	for i := 0; i < maxUAs; i++ {
+		// Truncate long user agents for display
+		ua := uaList[i].ua
+		if len(ua) > maxUserAgentDisplayLength {
+			ua = ua[:maxUserAgentTruncateLength] + "..."
+		}
+		data.TopUserAgents.Labels = append(data.TopUserAgents.Labels, ua)
+		data.TopUserAgents.Data = append(data.TopUserAgents.Data, uaList[i].count)
+	}
+
+	return data
+}
+
+// handleChartData handles requests for chart data in JSON format.
+//
+// It validates the authentication token and returns chart data as JSON.
+//
+// Parameters:
+//   - w: the HTTP response writer
+//   - r: the HTTP request
+func (cfg *Config) handleChartData(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	// Validate authentication
+	if !cfg.isAuthenticated(r) {
+		w.WriteHeader(http.StatusForbidden)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid or missing authentication token"})
+		return
+	}
+
+	// Check if context is cancelled
+	if ctx.Err() != nil {
+		return
+	}
+
+	data := cfg.getChartData()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(data)
+}
+
+// handleAdminLogin handles login requests for the admin UI.
+//
+// It accepts a token via query parameter, validates it, and sets an HTTP cookie
+// if valid. For backward compatibility, it also accepts the token in the URL.
+//
+// Parameters:
+//   - w: the HTTP response writer
+//   - r: the HTTP request
+func (cfg *Config) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	// Check if context is cancelled
+	if ctx.Err() != nil {
+		return
+	}
+
+	token := r.URL.Query().Get("token")
+	if !cfg.validateAdminToken(token) {
+		w.WriteHeader(http.StatusForbidden)
+		w.Header().Set("Content-Type", "text/html")
+		io.WriteString(w, "<!DOCTYPE html>\n<html>\n<head><title>Access Denied</title></head>\n<body>\n<h1>403 Forbidden</h1>\n<p>Invalid or missing authentication token.</p>\n</body>\n</html>")
+		return
+	}
+
+	// Set authentication cookie
+	cfg.setAdminCookie(w)
+
+	// Redirect to admin UI (without token in URL)
+	http.Redirect(w, r, cfg.adminPath, http.StatusSeeOther)
+}
+
+// writeAdminHTMLHeader writes the HTML header, styles, and opening body tag for the admin UI.
+//
+// Parameters:
+//   - sb: the string builder to write to
+func (cfg *Config) writeAdminHTMLHeader(sb *strings.Builder) {
+	sb.WriteString("<!DOCTYPE html>\n<html>\n<head>\n")
+	sb.WriteString("<title>gospidertrap - dashboard</title>\n")
+	sb.WriteString("<style>\n")
+	sb.WriteString("body { font-family: monospace; margin: 20px; background: #f5f5f5; }\n")
+	sb.WriteString("h1 { color: #333; }\n")
+	sb.WriteString(".stat-box { background: white; padding: 15px; margin: 10px 0; border-radius: 5px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }\n")
+	sb.WriteString("table { width: 100%; border-collapse: collapse; margin-top: 10px; }\n")
+	sb.WriteString("th, td { padding: 8px; text-align: left; border-bottom: 1px solid #ddd; }\n")
+	sb.WriteString("th { background-color: #4CAF50; color: white; }\n")
+	sb.WriteString("tr:hover { background-color: #f5f5f5; }\n")
+	sb.WriteString(".ip { font-family: monospace; }\n")
+	sb.WriteString(".chart-container { position: relative; height: 300px; margin: 20px 0; }\n")
+	sb.WriteString(".charts-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin: 20px 0; }\n")
+	sb.WriteString("@media (max-width: 768px) { .charts-grid { grid-template-columns: 1fr; } }\n")
+	sb.WriteString(".chart-table-row { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin: 20px 0; }\n")
+	sb.WriteString("@media (max-width: 768px) { .chart-table-row { grid-template-columns: 1fr; } }\n")
+	sb.WriteString("</style>\n")
+	sb.WriteString("<script src=\"https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js\"></script>\n")
+	sb.WriteString("</head>\n<body>\n")
+	sb.WriteString("<h1>gospidertrap</h1>\n")
+}
+
+// writeAdminStatsBox writes the overall server statistics box.
+//
+// Parameters:
+//   - sb: the string builder to write to
+//   - uptime: the server uptime duration
+//   - totalRequests: total number of requests
+//   - uniqueIPs: number of unique IP addresses
+//   - uniqueUAs: number of unique user agents
+func (cfg *Config) writeAdminStatsBox(sb *strings.Builder, uptime time.Duration, totalRequests, uniqueIPs, uniqueUAs int) {
+	sb.WriteString("<div class=\"stat-box\">\n")
+	sb.WriteString("<h2>Server Statistics</h2>\n")
+	sb.WriteString("<p><strong>Uptime:</strong> " + html.EscapeString(uptime.String()) + "</p>\n")
+	sb.WriteString("<p><strong>Total Requests:</strong> " + strconv.Itoa(totalRequests) + "</p>\n")
+	sb.WriteString("<p><strong>Unique IPs:</strong> " + strconv.Itoa(uniqueIPs) + "</p>\n")
+	sb.WriteString("<p><strong>Unique User Agents:</strong> " + strconv.Itoa(uniqueUAs) + "</p>\n")
+	sb.WriteString("</div>\n")
+}
+
+// writeAdminTopIPsSection writes the top IP addresses chart and table section.
+//
+// Parameters:
+//   - sb: the string builder to write to
+//   - chartData: the chart data containing top IPs
+func (cfg *Config) writeAdminTopIPsSection(sb *strings.Builder, chartData ChartData) {
+	sb.WriteString("<div class=\"chart-table-row\">\n")
+	// Top IP Addresses Chart
+	sb.WriteString("<div class=\"stat-box\">\n")
+	sb.WriteString("<h2>Top IP Addresses</h2>\n")
+	sb.WriteString("<div class=\"chart-container\"><canvas id=\"ipChart\"></canvas></div>\n")
+	sb.WriteString("</div>\n")
+
+	// Top IP Addresses Table
+	if len(chartData.TopIPs.Labels) > 0 {
+		sb.WriteString("<div class=\"stat-box\">\n")
+		sb.WriteString("<h2>Top IP Addresses</h2>\n")
+		sb.WriteString("<table>\n")
+		sb.WriteString("<tr><th>IP Address</th><th>Request Count</th></tr>\n")
+
+		for i := 0; i < len(chartData.TopIPs.Labels); i++ {
+			sb.WriteString("<tr><td class=\"ip\">")
+			sb.WriteString(html.EscapeString(chartData.TopIPs.Labels[i]))
+			sb.WriteString("</td><td>")
+			sb.WriteString(strconv.Itoa(chartData.TopIPs.Data[i]))
+			sb.WriteString("</td></tr>\n")
+		}
+		sb.WriteString("</table>\n")
+		sb.WriteString("</div>\n")
+	}
+	sb.WriteString("</div>\n")
+}
+
+// writeAdminTopUAsSection writes the top user agents chart and table section.
+//
+// Parameters:
+//   - sb: the string builder to write to
+//   - chartData: the chart data containing top user agents
+func (cfg *Config) writeAdminTopUAsSection(sb *strings.Builder, chartData ChartData) {
+	sb.WriteString("<div class=\"chart-table-row\">\n")
+	// Top User Agents Chart
+	sb.WriteString("<div class=\"stat-box\">\n")
+	sb.WriteString("<h2>Top User Agents</h2>\n")
+	sb.WriteString("<div class=\"chart-container\"><canvas id=\"uaChart\"></canvas></div>\n")
+	sb.WriteString("</div>\n")
+
+	// Top User Agents Table
+	if len(chartData.TopUserAgents.Labels) > 0 {
+		sb.WriteString("<div class=\"stat-box\">\n")
+		sb.WriteString("<h2>Top User Agents</h2>\n")
+		sb.WriteString("<table>\n")
+		sb.WriteString("<tr><th>User Agent</th><th>Request Count</th></tr>\n")
+
+		for i := 0; i < len(chartData.TopUserAgents.Labels); i++ {
+			sb.WriteString("<tr><td>")
+			sb.WriteString(html.EscapeString(chartData.TopUserAgents.Labels[i]))
+			sb.WriteString("</td><td>")
+			sb.WriteString(strconv.Itoa(chartData.TopUserAgents.Data[i]))
+			sb.WriteString("</td></tr>\n")
+		}
+		sb.WriteString("</table>\n")
+		sb.WriteString("</div>\n")
+	}
+	sb.WriteString("</div>\n")
+}
+
+// writeAdminRecentRequestsSection writes the recent requests table section.
+//
+// Parameters:
+//   - sb: the string builder to write to
+//   - recentRequests: the slice of recent requests
+func (cfg *Config) writeAdminRecentRequestsSection(sb *strings.Builder, recentRequests []RequestInfo) {
+	sb.WriteString("<div class=\"stat-box\">\n")
+	sb.WriteString("<h2>Recent Requests</h2>\n")
+	if len(recentRequests) > 0 {
+		sb.WriteString("<table>\n")
+		sb.WriteString("<tr><th>Timestamp</th><th>IP Address</th><th>Path</th><th>User Agent</th></tr>\n")
+
+		// Show requests in reverse order (most recent first)
+		startIdx := len(recentRequests) - 1
+		if startIdx >= maxRecentRequestsDisplay {
+			startIdx = maxRecentRequestsDisplay - 1
+		}
+		for i := startIdx; i >= 0; i-- {
+			req := recentRequests[i]
+			sb.WriteString("<tr><td>")
+			sb.WriteString(html.EscapeString(req.Timestamp.Format("2006-01-02 15:04:05")))
+			sb.WriteString("</td><td class=\"ip\">")
+			sb.WriteString(html.EscapeString(req.IP))
+			sb.WriteString("</td><td>")
+			sb.WriteString(html.EscapeString(req.Path))
+			sb.WriteString("</td><td>")
+			sb.WriteString(html.EscapeString(req.UserAgent))
+			sb.WriteString("</td></tr>\n")
+		}
+		sb.WriteString("</table>\n")
+	} else {
+		sb.WriteString("<p>No recent requests yet.</p>\n")
+	}
+	sb.WriteString("</div>\n")
+}
+
+// writeAdminChartScript writes the JavaScript code for loading and rendering charts.
+//
+// Parameters:
+//   - sb: the string builder to write to
+func (cfg *Config) writeAdminChartScript(sb *strings.Builder) {
+	sb.WriteString("<script>\n")
+	sb.WriteString("const baseDataUrl = '")
+	sb.WriteString(html.EscapeString(cfg.adminPath))
+	sb.WriteString("/data';\n")
+	sb.WriteString("let ipChart = null;\n")
+	sb.WriteString("let uaChart = null;\n")
+	sb.WriteString("\n")
+	sb.WriteString("async function loadCharts() {\n")
+	sb.WriteString("  try {\n")
+	sb.WriteString("    const response = await fetch(baseDataUrl);\n")
+	sb.WriteString("    if (!response.ok) throw new Error('Failed to load chart data');\n")
+	sb.WriteString("    const data = await response.json();\n")
+	sb.WriteString("\n")
+	sb.WriteString("    // Top IPs Donut Chart\n")
+	sb.WriteString("    if (!ipChart) {\n")
+	sb.WriteString("      ipChart = new Chart(document.getElementById('ipChart'), {\n")
+	sb.WriteString("      type: 'doughnut',\n")
+	sb.WriteString("      data: {\n")
+	sb.WriteString("        labels: data.topIPs.labels,\n")
+	sb.WriteString("        datasets: [{\n")
+	sb.WriteString("          data: data.topIPs.data,\n")
+	sb.WriteString("          backgroundColor: [\n")
+	sb.WriteString("            'rgba(255, 99, 132, 0.8)',\n")
+	sb.WriteString("            'rgba(54, 162, 235, 0.8)',\n")
+	sb.WriteString("            'rgba(255, 206, 86, 0.8)',\n")
+	sb.WriteString("            'rgba(75, 192, 192, 0.8)',\n")
+	sb.WriteString("            'rgba(153, 102, 255, 0.8)',\n")
+	sb.WriteString("            'rgba(255, 159, 64, 0.8)',\n")
+	sb.WriteString("            'rgba(199, 199, 199, 0.8)',\n")
+	sb.WriteString("            'rgba(83, 102, 255, 0.8)',\n")
+	sb.WriteString("          ]\n")
+	sb.WriteString("        }]\n")
+	sb.WriteString("      },\n")
+	sb.WriteString("      options: {\n")
+	sb.WriteString("        responsive: true,\n")
+	sb.WriteString("        maintainAspectRatio: false,\n")
+	sb.WriteString("        plugins: {\n")
+	sb.WriteString("          legend: { position: 'bottom' }\n")
+	sb.WriteString("        }\n")
+	sb.WriteString("      }\n")
+	sb.WriteString("    });\n")
+	sb.WriteString("    }\n")
+	sb.WriteString("\n")
+	sb.WriteString("    // Top User Agents Donut Chart\n")
+	sb.WriteString("    if (!uaChart) {\n")
+	sb.WriteString("      uaChart = new Chart(document.getElementById('uaChart'), {\n")
+	sb.WriteString("      type: 'doughnut',\n")
+	sb.WriteString("      data: {\n")
+	sb.WriteString("        labels: data.topUserAgents.labels,\n")
+	sb.WriteString("        datasets: [{\n")
+	sb.WriteString("          data: data.topUserAgents.data,\n")
+	sb.WriteString("          backgroundColor: [\n")
+	sb.WriteString("            'rgba(255, 99, 132, 0.8)',\n")
+	sb.WriteString("            'rgba(54, 162, 235, 0.8)',\n")
+	sb.WriteString("            'rgba(255, 206, 86, 0.8)',\n")
+	sb.WriteString("            'rgba(75, 192, 192, 0.8)',\n")
+	sb.WriteString("            'rgba(153, 102, 255, 0.8)',\n")
+	sb.WriteString("            'rgba(255, 159, 64, 0.8)',\n")
+	sb.WriteString("            'rgba(199, 199, 199, 0.8)',\n")
+	sb.WriteString("            'rgba(83, 102, 255, 0.8)'\n")
+	sb.WriteString("          ]\n")
+	sb.WriteString("        }]\n")
+	sb.WriteString("      },\n")
+	sb.WriteString("      options: {\n")
+	sb.WriteString("        responsive: true,\n")
+	sb.WriteString("        maintainAspectRatio: false,\n")
+	sb.WriteString("        plugins: {\n")
+	sb.WriteString("          legend: { position: 'bottom' }\n")
+	sb.WriteString("        }\n")
+	sb.WriteString("      }\n")
+	sb.WriteString("    });\n")
+	sb.WriteString("    }\n")
+	sb.WriteString("  } catch (error) {\n")
+	sb.WriteString("    console.error('Error loading charts:', error);\n")
+	sb.WriteString("  }\n")
+	sb.WriteString("}\n")
+	sb.WriteString("\n")
+	sb.WriteString("loadCharts();\n")
+	sb.WriteString("</script>\n")
+}
+
+// handleAdminUI handles requests to the admin UI endpoint.
+//
+// It validates authentication via cookie or query parameter (for backward compatibility).
+// If authentication fails, it returns a 403 Forbidden response.
+// Otherwise, it displays connection statistics including total requests, IP counts,
+// user agent counts, and recent request history in a formatted HTML page.
+//
+// Parameters:
+//   - w: the HTTP response writer
+//   - r: the HTTP request
+func (cfg *Config) handleAdminUI(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	// Check if context is cancelled
+	if ctx.Err() != nil {
+		return
+	}
+
+	// Validate authentication (supports both cookie and query param for backward compatibility)
+	if !cfg.isAuthenticated(r) {
+		// If token is in query param but not in cookie, set cookie for future requests
+		if token := r.URL.Query().Get("token"); token != "" && cfg.validateAdminToken(token) {
+			cfg.setAdminCookie(w)
+		} else {
+			w.WriteHeader(http.StatusForbidden)
+			w.Header().Set("Content-Type", "text/html")
+			io.WriteString(w, "<!DOCTYPE html>\n<html>\n<head><title>Access Denied</title></head>\n<body>\n<h1>403 Forbidden</h1>\n<p>Invalid or missing authentication token.</p>\n<p>Use: <a href=\""+html.EscapeString(cfg.adminPath)+"/login?token=YOUR_TOKEN\">Login</a></p>\n</body>\n</html>")
+			return
+		}
+	}
+
+	// Check context again before processing
+	if ctx.Err() != nil {
+		return
+	}
+
+	// Get chart data (reuses existing efficient sorting logic)
+	chartData := cfg.getChartData()
+
+	cfg.stats.mu.RLock()
+	uptime := time.Since(cfg.stats.StartTime)
+	totalRequests := cfg.stats.TotalRequests
+	uniqueIPs := len(cfg.stats.IPCounts)
+	uniqueUAs := len(cfg.stats.UserAgents)
+	recentRequests := make([]RequestInfo, len(cfg.stats.RecentRequests))
+	copy(recentRequests, cfg.stats.RecentRequests)
+	cfg.stats.mu.RUnlock()
+
+	// Build HTML using helper functions
+	var sb strings.Builder
+	cfg.writeAdminHTMLHeader(&sb)
+	cfg.writeAdminStatsBox(&sb, uptime, totalRequests, uniqueIPs, uniqueUAs)
+	cfg.writeAdminTopIPsSection(&sb, chartData)
+	cfg.writeAdminTopUAsSection(&sb, chartData)
+	cfg.writeAdminRecentRequestsSection(&sb, recentRequests)
+	cfg.writeAdminChartScript(&sb)
+	sb.WriteString("</body>\n</html>")
+
+	w.Header().Set("Content-Type", "text/html")
+	io.WriteString(w, sb.String())
+}
+
+// PersistedStats holds the serializable form of Stats for JSON persistence.
+type PersistedStats struct {
+	StartTime      time.Time      `json:"startTime"`
+	TotalRequests  int            `json:"totalRequests"`
+	IPCounts       map[string]int `json:"ipCounts"`
+	UserAgents     map[string]int `json:"userAgents"`
+	RecentRequests []RequestInfo  `json:"recentRequests"`
+}
+
+// ensureDataDir creates the data directory if it doesn't exist.
+//
+// Returns an error if the directory cannot be created.
+func (cfg *Config) ensureDataDir() error {
+	if cfg.dataDir == "" {
+		return nil // Persistence disabled
+	}
+	return os.MkdirAll(cfg.dataDir, 0755)
+}
+
+// openLogFile opens or creates the NDJSON log file for appending requests.
+//
+// Returns an error if the file cannot be opened.
+func (cfg *Config) openLogFile() error {
+	if cfg.dataDir == "" {
+		return nil // Persistence disabled
+	}
+
+	logPath := filepath.Join(cfg.dataDir, requestsLogFileName)
+	file, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to open log file: %w", err)
+	}
+	cfg.logFile = file
+	return nil
+}
+
+// closeLogFile closes the NDJSON log file.
+func (cfg *Config) closeLogFile() {
+	if cfg.logFile != nil {
+		cfg.logFile.Close()
+		cfg.logFile = nil
+	}
+}
+
+// appendRequestToLog appends a request to the NDJSON log file.
+//
+// Parameters:
+//   - reqInfo: the request information to log
+func (cfg *Config) appendRequestToLog(reqInfo RequestInfo) {
+	if cfg.dataDir == "" || cfg.logFile == nil {
+		return // Persistence disabled
+	}
+
+	cfg.logFileMu.Lock()
+	defer cfg.logFileMu.Unlock()
+
+	encoder := json.NewEncoder(cfg.logFile)
+	if err := encoder.Encode(reqInfo); err != nil {
+		// Log error but don't fail the request
+		cfg.logger.Warn("Failed to write to log file", "error", err)
+	} else {
+		// Flush to ensure data is written to disk
+		cfg.logFile.Sync()
+	}
+}
+
+// saveStats saves the aggregated statistics to a JSON file.
+//
+// Returns an error if the file cannot be written.
+func (cfg *Config) saveStats() error {
+	if cfg.dataDir == "" {
+		return nil // Persistence disabled
+	}
+
+	cfg.stats.mu.RLock()
+	persisted := PersistedStats{
+		StartTime:      cfg.stats.StartTime,
+		TotalRequests:   cfg.stats.TotalRequests,
+		IPCounts:       make(map[string]int),
+		UserAgents:     make(map[string]int),
+		RecentRequests: make([]RequestInfo, len(cfg.stats.RecentRequests)),
+	}
+	// Copy maps to avoid holding lock during I/O
+	for k, v := range cfg.stats.IPCounts {
+		persisted.IPCounts[k] = v
+	}
+	for k, v := range cfg.stats.UserAgents {
+		persisted.UserAgents[k] = v
+	}
+	// Copy recent requests slice
+	copy(persisted.RecentRequests, cfg.stats.RecentRequests)
+	cfg.stats.mu.RUnlock()
+
+	statsPath := filepath.Join(cfg.dataDir, statsFileName)
+	data, err := json.MarshalIndent(persisted, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal stats: %w", err)
+	}
+
+	if err := os.WriteFile(statsPath, data, 0644); err != nil {
+		return fmt.Errorf("failed to write stats file: %w", err)
+	}
+
+	return nil
+}
+
+// loadStats loads aggregated statistics from a JSON file if it exists.
+//
+// If the file doesn't exist, it returns nil (not an error).
+// Returns an error if the file exists but cannot be read or parsed.
+func (cfg *Config) loadStats() error {
+	if cfg.dataDir == "" {
+		return nil // Persistence disabled
+	}
+
+	statsPath := filepath.Join(cfg.dataDir, statsFileName)
+	data, err := os.ReadFile(statsPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // File doesn't exist yet, that's okay
+		}
+		return fmt.Errorf("failed to read stats file: %w", err)
+	}
+
+	var persisted PersistedStats
+	if err := json.Unmarshal(data, &persisted); err != nil {
+		return fmt.Errorf("failed to unmarshal stats: %w", err)
+	}
+
+	cfg.stats.mu.Lock()
+	defer cfg.stats.mu.Unlock()
+
+	// Restore stats, but keep the current StartTime for this session
+	cfg.stats.TotalRequests = persisted.TotalRequests
+	cfg.stats.IPCounts = persisted.IPCounts
+	cfg.stats.UserAgents = persisted.UserAgents
+	
+	// Restore recent requests, but limit to MaxRecentRequests
+	if len(persisted.RecentRequests) > cfg.stats.MaxRecentRequests {
+		// Keep only the most recent requests
+		startIdx := len(persisted.RecentRequests) - cfg.stats.MaxRecentRequests
+		cfg.stats.RecentRequests = persisted.RecentRequests[startIdx:]
+	} else {
+		cfg.stats.RecentRequests = persisted.RecentRequests
+	}
+
+	return nil
+}
+
+// startPeriodicSave starts a goroutine that periodically saves stats to disk.
+func (cfg *Config) startPeriodicSave() {
+	if cfg.dataDir == "" {
+		return // Persistence disabled
+	}
+
+	go func() {
+		ticker := time.NewTicker(statsSaveInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				if err := cfg.saveStats(); err != nil {
+					cfg.logger.Warn("Failed to save stats periodically", "error", err)
+				}
+			case <-cfg.saveCtx.Done():
+				return
+			}
+		}
+	}()
+}
+
+// stopPeriodicSave stops the periodic stats saving goroutine.
+func (cfg *Config) stopPeriodicSave() {
+	if cfg.saveCancel != nil {
+		cfg.saveCancel()
+	}
+}
+
+// getClientIP extracts the client IP address from the request.
+//
+// It checks X-Forwarded-For and X-Real-IP headers for proxied requests,
+// falling back to RemoteAddr if those headers are not present.
+//
+// Parameters:
+//   - r: the HTTP request
+//
+// Returns the client IP address as a string.
+func getClientIP(r *http.Request) string {
+	// Check X-Forwarded-For header (first IP in comma-separated list)
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		ips := strings.Split(xff, ",")
+		if len(ips) > 0 {
+			return strings.TrimSpace(ips[0])
+		}
+	}
+	// Check X-Real-IP header
+	if xri := r.Header.Get("X-Real-IP"); xri != "" {
+		return strings.TrimSpace(xri)
+	}
+	// Fall back to RemoteAddr, removing port if present
+	ip := r.RemoteAddr
+	if colonIdx := strings.LastIndex(ip, ":"); colonIdx != -1 {
+		ip = ip[:colonIdx]
+	}
+	return ip
+}
+
+// recordRequest records request information in the stats.
+//
+// Parameters:
+//   - r: the HTTP request
+func (cfg *Config) recordRequest(r *http.Request) {
+	ip := getClientIP(r)
+	userAgent := r.Header.Get("User-Agent")
+	if userAgent == "" {
+		userAgent = "Unknown"
+	}
+	path := r.URL.Path
+	now := time.Now()
+
+	// Create request info
+	reqInfo := RequestInfo{
+		IP:        ip,
+		UserAgent: userAgent,
+		Path:      path,
+		Timestamp: now,
+	}
+
+	// Append to NDJSON log file (async, non-blocking)
+	cfg.appendRequestToLog(reqInfo)
+
+	cfg.stats.mu.Lock()
+	defer cfg.stats.mu.Unlock()
+
+	cfg.stats.TotalRequests++
+	cfg.stats.IPCounts[ip]++
+	cfg.stats.UserAgents[userAgent]++
+
+	// Add to recent requests
+	cfg.stats.RecentRequests = append(cfg.stats.RecentRequests, reqInfo)
+
+	// Keep only the most recent requests
+	if len(cfg.stats.RecentRequests) > cfg.stats.MaxRecentRequests {
+		cfg.stats.RecentRequests = cfg.stats.RecentRequests[1:]
+	}
+}
+
 // handleRequest handles HTTP requests by generating and serving HTML pages.
 //
 // It adds a configurable delay to simulate real-world response times,
 // sets the Content-Type header to text/html, and writes the generated
-// HTML page to the response writer.
+// HTML page to the response writer. It also records request statistics.
+// Requests to the admin path are excluded from statistics.
 //
 // Parameters:
 //   - w: the HTTP response writer
-//   - r: the HTTP request (currently unused but required by the interface)
+//   - r: the HTTP request
 func (cfg *Config) handleRequest(w http.ResponseWriter, r *http.Request) {
-	// Add delay to simulate real-world response times
-	time.Sleep(time.Duration(delayMilliseconds) * time.Millisecond)
+	ctx := r.Context()
+
+	// Only record requests that are not to the admin path
+	if r.URL.Path != cfg.adminPath {
+		cfg.recordRequest(r)
+	}
+
+	// Add delay to simulate real-world response times, respecting context cancellation
+	select {
+	case <-ctx.Done():
+		// Request was cancelled or timed out
+		cfg.logger.Warn("Request cancelled or timed out", "path", r.URL.Path, "error", ctx.Err())
+		return
+	case <-time.After(time.Duration(delayMilliseconds) * time.Millisecond):
+		// Delay completed
+	}
+
+	// Check context again before writing response
+	if ctx.Err() != nil {
+		return
+	}
+
 	w.Header().Set("Content-Type", "text/html")
 	io.WriteString(w, cfg.generatePage())
 }
@@ -240,12 +1080,13 @@ func (cfg *Config) handleRequest(w http.ResponseWriter, r *http.Request) {
 // printUsage prints the command-line usage information to stdout.
 // It displays the program name, available flags, and their descriptions.
 func printUsage() {
-	fmt.Println("Usage:", os.Args[0], "[-p PORT] -a HTML_FILE -w WORDLIST_FILE [-e ENDPOINT]")
+	fmt.Println("Usage:", os.Args[0], "[-p PORT] -a HTML_FILE -w WORDLIST_FILE [-e ENDPOINT] [-d DATA_DIR]")
 	fmt.Println()
 	fmt.Println("-p   Port to run the server on (default: 8000)")
 	fmt.Println("-a   HTML file input, replace <a href> links")
 	fmt.Println("-e   Endpoint to point form GET requests to (optional)")
 	fmt.Println("-w   Wordlist to use for links")
+	fmt.Println("-d   Data directory for persistence (default: data, empty to disable)")
 }
 
 func main() {
@@ -257,6 +1098,7 @@ func main() {
 	flag.StringVar(&htmlFile, "a", "", "HTML file containing links to be replaced")
 	flag.StringVar(&wordlistFile, "w", "", "Wordlist file to use for links")
 	flag.StringVar(&cfg.endpoint, "e", "", "Endpoint to point form GET requests to")
+	flag.StringVar(&cfg.dataDir, "d", defaultDataDir, "Data directory for persistence (empty to disable)")
 	flag.Usage = printUsage
 	flag.Parse()
 
@@ -264,30 +1106,84 @@ func main() {
 	if htmlFile != "" {
 		content, err := os.ReadFile(htmlFile)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: can't read HTML file: %v\n", err)
+			cfg.logger.Error("Failed to read HTML file", "file", htmlFile, "error", err)
+			os.Exit(1)
+		}
+		if len(content) > maxHTMLTemplateSize {
+			cfg.logger.Error("HTML file too large", "file", htmlFile, "size", len(content), "max", maxHTMLTemplateSize)
 			os.Exit(1)
 		}
 		cfg.htmlTemplate = string(content)
+		cfg.logger.Info("Loaded HTML template", "file", htmlFile, "size", len(content))
 	}
 
 	// Load wordlist if provided
 	if wordlistFile != "" {
 		if err := cfg.loadWordlist(wordlistFile); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: %v. Using randomly generated links.\n", err)
+			cfg.logger.Error("Failed to load wordlist", "file", wordlistFile, "error", err)
+			os.Exit(1)
 		}
 		if len(cfg.webpages) == 0 {
-			fmt.Println("No links found in the wordlist file. Using randomly generated links.")
+			cfg.logger.Warn("No links found in wordlist file, using randomly generated links", "file", wordlistFile)
+		} else {
+			cfg.logger.Info("Loaded wordlist", "file", wordlistFile, "entries", len(cfg.webpages))
 		}
+	}
+
+	// Setup persistence if data directory is specified
+	if cfg.dataDir != "" {
+		if err := cfg.ensureDataDir(); err != nil {
+			cfg.logger.Error("Failed to create data directory", "dir", cfg.dataDir, "error", err)
+			os.Exit(1)
+		}
+
+		// Load existing stats if available
+		if err := cfg.loadStats(); err != nil {
+			cfg.logger.Warn("Failed to load stats", "error", err)
+		} else {
+			statsPath := filepath.Join(cfg.dataDir, statsFileName)
+			cfg.logger.Info("Loaded existing stats", "file", statsPath)
+		}
+
+		// Open log file for appending requests
+		if err := cfg.openLogFile(); err != nil {
+			cfg.logger.Error("Failed to open log file", "error", err)
+			os.Exit(1)
+		}
+		defer cfg.closeLogFile()
+
+		// Start periodic stats saving
+		cfg.startPeriodicSave()
+		defer cfg.stopPeriodicSave()
+		cfg.logger.Info("Persistence enabled", "dataDir", cfg.dataDir)
 	}
 
 	// Validate and setup server
 	if err := cfg.validatePort(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		cfg.logger.Error("Invalid port configuration", "port", cfg.port, "error", err)
 		os.Exit(1)
 	}
 
+	// Generate random admin endpoint and token
+	// Ensure admin path doesn't conflict with root or common paths
+	cfg.adminPath = cfg.generateAdminPath()
+	for cfg.adminPath == "/" || strings.HasPrefix(cfg.adminPath, "/data") {
+		cfg.adminPath = cfg.generateAdminPath()
+	}
+	cfg.adminToken = cfg.generateAdminToken()
+
 	server := cfg.createHTTPServer()
+	// Register admin handlers first so they take precedence over the root handler
+	http.HandleFunc(cfg.adminPath+"/login", cfg.handleAdminLogin)
+	http.HandleFunc(cfg.adminPath+"/data", cfg.handleChartData)
+	http.HandleFunc(cfg.adminPath, cfg.handleAdminUI)
 	http.HandleFunc("/", cfg.handleRequest)
+
+	// Log admin UI URLs
+	adminURL := fmt.Sprintf("http://localhost:%s%s?token=%s", cfg.port, cfg.adminPath, cfg.adminToken)
+	adminLoginURL := fmt.Sprintf("http://localhost:%s%s/login?token=%s", cfg.port, cfg.adminPath, cfg.adminToken)
+	cfg.logger.Info("Admin UI available", "url", adminURL)
+	cfg.logger.Info("Admin login endpoint", "url", adminLoginURL)
 
 	// Start server and handle graceful shutdown
 	cfg.runServer(server)
@@ -302,8 +1198,17 @@ func main() {
 // Parameters:
 //   - filename: the path to the wordlist file
 //
-// Returns an error if the file cannot be opened or read.
+// Returns an error if the file cannot be opened or read, or if it exceeds size limits.
 func (cfg *Config) loadWordlist(filename string) error {
+	// Check file size before reading
+	fileInfo, err := os.Stat(filename)
+	if err != nil {
+		return fmt.Errorf("can't read wordlist file: %w", err)
+	}
+	if fileInfo.Size() > maxWordlistFileSize {
+		return fmt.Errorf("wordlist file too large (%d bytes, max %d bytes)", fileInfo.Size(), maxWordlistFileSize)
+	}
+
 	file, err := os.Open(filename)
 	if err != nil {
 		return fmt.Errorf("can't read wordlist file: %w", err)
@@ -314,6 +1219,9 @@ func (cfg *Config) loadWordlist(filename string) error {
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line != "" {
+			if len(cfg.webpages) >= maxWordlistEntries {
+				return fmt.Errorf("wordlist has too many entries (max %d)", maxWordlistEntries)
+			}
 			cfg.webpages = append(cfg.webpages, line)
 		}
 	}
@@ -378,26 +1286,38 @@ func (cfg *Config) runServer(server *http.Server) {
 
 	// Start server in background
 	go func() {
-		fmt.Println("Starting server on port", cfg.port, "...")
+		cfg.logger.Info("Starting HTTP server", "port", cfg.port)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			fmt.Fprintf(os.Stderr, "Error: starting HTTP server on port %s: %v\n", cfg.port, err)
+			cfg.logger.Error("HTTP server error", "port", cfg.port, "error", err)
 			os.Exit(1)
 		}
 	}()
 
 	// Wait for shutdown signal
 	<-sigChan
-	fmt.Println("\nShutting down server...")
+	cfg.logger.Info("Shutdown signal received, shutting down server")
+
+	// Stop periodic saving
+	cfg.stopPeriodicSave()
+
+	// Save final stats snapshot
+	if cfg.dataDir != "" {
+		if err := cfg.saveStats(); err != nil {
+			cfg.logger.Warn("Failed to save final stats", "error", err)
+		} else {
+			cfg.logger.Info("Saved stats to disk")
+		}
+	}
 
 	// Graceful shutdown with timeout
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeoutSeconds*time.Second)
 	defer cancel()
 
 	if err := server.Shutdown(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: server forced to shutdown: %v\n", err)
+		cfg.logger.Error("Server forced to shutdown", "error", err)
 		os.Exit(1)
 	}
 
-	fmt.Println("Server stopped gracefully")
+	cfg.logger.Info("Server stopped gracefully")
 }
 
