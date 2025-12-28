@@ -29,10 +29,6 @@ var (
 	endpoint string
 )
 
-func init() {
-	rand.Seed(time.Now().UnixNano())
-}
-
 func generatePage() string {
 	var html string
 	html += "<html>\n<body>\n"
