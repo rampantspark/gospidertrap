@@ -81,6 +81,8 @@ jobs:
   release:
     needs: [version, build]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write  # Required to create GitHub releases
 
     steps:
     - name: Checkout code
