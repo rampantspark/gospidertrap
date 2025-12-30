@@ -105,8 +105,8 @@ func (h *Handler) HandleChartData(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get chart data from stats manager
-	data := h.statsManager.GetChartData(10, 50) // top 10 items, max 50 char user agents
+	// Get chart data from stats manager, passing context for cancellation support
+	data := h.statsManager.GetChartData(ctx, 10, 50) // top 10 items, max 50 char user agents
 
 	// Set security headers
 	h.setSecurityHeaders(w)
@@ -150,12 +150,12 @@ func (h *Handler) HandleUI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get chart data
-	chartData := h.statsManager.GetChartData(10, 50) // top 10 items, max 50 char user agents
+	// Get chart data, passing context for cancellation support
+	chartData := h.statsManager.GetChartData(ctx, 10, 50) // top 10 items, max 50 char user agents
 
-	// Get stats and recent requests
-	uptime, totalRequests, uniqueIPs, uniqueUAs := h.statsManager.GetStats()
-	recentRequests := h.statsManager.GetRecentRequests(50) // max 50 recent requests
+	// Get stats and recent requests, passing context for cancellation support
+	uptime, totalRequests, uniqueIPs, uniqueUAs := h.statsManager.GetStats(ctx)
+	recentRequests := h.statsManager.GetRecentRequests(ctx, 50) // max 50 recent requests
 
 	// Render HTML
 	html := h.renderer.RenderAdminUI(

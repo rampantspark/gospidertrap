@@ -2,6 +2,7 @@ package stats
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -51,12 +52,13 @@ func validateDataDirPath(dataDir, filePath string) error {
 // 5. Backs up original files (renamed with .migrated extension)
 //
 // Parameters:
+//   - ctx: context for cancellation and timeout control
 //   - db: the database instance to import data into
 //   - dataDir: directory containing the NDJSON/JSON files
 //   - logger: structured logger for migration progress
 //
 // Returns an error if migration fails, or nil if successful or no files to migrate.
-func MigrateFromFiles(db *Database, dataDir string, logger *slog.Logger) error {
+func MigrateFromFiles(ctx context.Context, db *Database, dataDir string, logger *slog.Logger) error {
 	if dataDir == "" {
 		return nil // No data directory configured
 	}
@@ -77,7 +79,7 @@ func MigrateFromFiles(db *Database, dataDir string, logger *slog.Logger) error {
 
 	// Migrate requests from NDJSON
 	if requestsExist {
-		if err := migrateRequestsNDJSON(db, requestsFile, logger); err != nil {
+		if err := migrateRequestsNDJSON(ctx, db, requestsFile, logger); err != nil {
 			return fmt.Errorf("failed to migrate requests: %w", err)
 		}
 		// Backup original file
@@ -90,7 +92,7 @@ func MigrateFromFiles(db *Database, dataDir string, logger *slog.Logger) error {
 
 	// Migrate aggregated stats from JSON (if we didn't already have data from NDJSON)
 	if statsExist {
-		if err := migrateStatsJSON(db, statsFile, logger); err != nil {
+		if err := migrateStatsJSON(ctx, db, statsFile, logger); err != nil {
 			return fmt.Errorf("failed to migrate stats: %w", err)
 		}
 		// Backup original file
@@ -106,7 +108,7 @@ func MigrateFromFiles(db *Database, dataDir string, logger *slog.Logger) error {
 }
 
 // migrateRequestsNDJSON reads requests from NDJSON file and imports into database.
-func migrateRequestsNDJSON(db *Database, filename string, logger *slog.Logger) error {
+func migrateRequestsNDJSON(ctx context.Context, db *Database, filename string, logger *slog.Logger) error {
 	// Validate path - extract dataDir from filename (it's constructed as filepath.Join(dataDir, "requests.ndjson"))
 	dataDir := filepath.Dir(filename)
 	if err := validateDataDirPath(dataDir, filename); err != nil {
@@ -125,13 +127,20 @@ func migrateRequestsNDJSON(db *Database, filename string, logger *slog.Logger) e
 
 	// Read and import each request
 	for scanner.Scan() {
+		// Check for context cancellation periodically
+		if count%100 == 0 {
+			if err := ctx.Err(); err != nil {
+				return fmt.Errorf("migration cancelled: %w", err)
+			}
+		}
+
 		var req RequestInfo
 		if err := json.Unmarshal(scanner.Bytes(), &req); err != nil {
 			logger.Warn("Failed to parse request line", "error", err)
 			continue
 		}
 
-		if err := db.RecordRequest(req); err != nil {
+		if err := db.RecordRequest(ctx, req); err != nil {
 			logger.Warn("Failed to import request", "error", err)
 			continue
 		}
@@ -154,7 +163,7 @@ func migrateRequestsNDJSON(db *Database, filename string, logger *slog.Logger) e
 //
 // Note: This is mainly for preserving the start time if NDJSON migration didn't
 // provide it. The counts will be recalculated from the request log.
-func migrateStatsJSON(db *Database, filename string, logger *slog.Logger) error {
+func migrateStatsJSON(ctx context.Context, db *Database, filename string, logger *slog.Logger) error {
 	// Validate path - extract dataDir from filename (it's constructed as filepath.Join(dataDir, "stats.json"))
 	dataDir := filepath.Dir(filename)
 	if err := validateDataDirPath(dataDir, filename); err != nil {
@@ -173,7 +182,7 @@ func migrateStatsJSON(db *Database, filename string, logger *slog.Logger) error 
 	}
 
 	// Update start time in database
-	_, err = db.db.Exec(`
+	_, err = db.db.ExecContext(ctx, `
 		UPDATE stats
 		SET start_time = ?
 		WHERE id = 1 AND start_time > ?
