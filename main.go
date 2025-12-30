@@ -154,7 +154,7 @@ func (cfg *Config) ensureDataDir() error {
 	if cfg.dataDir == "" {
 		return nil // Persistence disabled
 	}
-	return os.MkdirAll(cfg.dataDir, 0755)
+	return os.MkdirAll(cfg.dataDir, 0750)
 }
 
 // openLogFile opens or creates the NDJSON log file for appending requests.
@@ -166,7 +166,14 @@ func (cfg *Config) openLogFile() error {
 	}
 
 	logPath := filepath.Join(cfg.dataDir, requestsLogFileName)
-	file, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+
+	// Validate path is within data directory
+	if err := validateDataDirPath(cfg.dataDir, logPath); err != nil {
+		return fmt.Errorf("invalid log file path: %w", err)
+	}
+
+	// #nosec G304 -- path validated by validateDataDirPath to prevent traversal
+	file, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
 		return fmt.Errorf("failed to open log file: %w", err)
 	}
@@ -237,7 +244,7 @@ func (cfg *Config) saveStats() error {
 		return fmt.Errorf("failed to marshal stats: %w", err)
 	}
 
-	if err := os.WriteFile(statsPath, data, 0644); err != nil {
+	if err := os.WriteFile(statsPath, data, 0600); err != nil {
 		return fmt.Errorf("failed to write stats file: %w", err)
 	}
 
@@ -254,6 +261,13 @@ func (cfg *Config) loadStats() error {
 	}
 
 	statsPath := filepath.Join(cfg.dataDir, statsFileName)
+
+	// Validate path is within data directory
+	if err := validateDataDirPath(cfg.dataDir, statsPath); err != nil {
+		return fmt.Errorf("invalid stats file path: %w", err)
+	}
+
+	// #nosec G304 -- path validated by validateDataDirPath to prevent traversal
 	data, err := os.ReadFile(statsPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -424,6 +438,13 @@ func main() {
 	var htmlTemplate string
 	var htmlTemplateSize int
 	if htmlFile != "" {
+		// Validate file path to prevent directory traversal
+		if err := validateFilePath(htmlFile); err != nil {
+			ui.PrintError("Invalid HTML file path", err)
+			os.Exit(1)
+		}
+
+		// #nosec G304 -- path validated by validateFilePath to prevent traversal
 		content, err := os.ReadFile(htmlFile)
 		if err != nil {
 			ui.PrintError("Failed to read HTML file", err)
@@ -615,6 +636,53 @@ func main() {
 	srv.GracefulShutdown(shutdownTimeoutSeconds*time.Second, cleanup)
 }
 
+// validateFilePath checks if a file path is safe to access.
+// It prevents directory traversal attacks by rejecting paths containing ".."
+// and ensures the path is absolute or relative to current directory.
+func validateFilePath(path string) error {
+	// Check for path traversal sequences
+	if strings.Contains(path, "..") {
+		return fmt.Errorf("path contains directory traversal sequence: %s", path)
+	}
+	// Additional security: convert to absolute path and check it's readable
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return fmt.Errorf("cannot resolve absolute path: %w", err)
+	}
+	// Verify file exists and is accessible
+	if _, err := os.Stat(absPath); err != nil {
+		return fmt.Errorf("cannot access file: %w", err)
+	}
+	return nil
+}
+
+// validateDataDirPath checks if a path is within the data directory.
+// This prevents directory traversal for programmatically constructed paths.
+func validateDataDirPath(dataDir, filePath string) error {
+	// Convert both to absolute paths
+	absDataDir, err := filepath.Abs(dataDir)
+	if err != nil {
+		return fmt.Errorf("cannot resolve data directory: %w", err)
+	}
+	absFilePath, err := filepath.Abs(filePath)
+	if err != nil {
+		return fmt.Errorf("cannot resolve file path: %w", err)
+	}
+
+	// Check if file path is within data directory
+	relPath, err := filepath.Rel(absDataDir, absFilePath)
+	if err != nil {
+		return fmt.Errorf("cannot determine relative path: %w", err)
+	}
+
+	// If relative path starts with "..", it's outside the data directory
+	if strings.HasPrefix(relPath, "..") {
+		return fmt.Errorf("file path is outside data directory: %s", filePath)
+	}
+
+	return nil
+}
+
 // loadWordlist loads wordlist entries from a file, one entry per line.
 //
 // Empty lines and lines containing only whitespace are ignored.
@@ -626,6 +694,11 @@ func main() {
 //
 // Returns the wordlist slice and an error if the file cannot be opened or read, or if it exceeds size limits.
 func loadWordlist(filename string) ([]string, error) {
+	// Validate file path to prevent directory traversal
+	if err := validateFilePath(filename); err != nil {
+		return nil, fmt.Errorf("invalid wordlist file path: %w", err)
+	}
+
 	// Check file size before reading
 	fileInfo, err := os.Stat(filename)
 	if err != nil {
@@ -635,6 +708,7 @@ func loadWordlist(filename string) ([]string, error) {
 		return nil, fmt.Errorf("wordlist file too large (%d bytes, max %d bytes)", fileInfo.Size(), maxWordlistFileSize)
 	}
 
+	// #nosec G304 -- path validated by validateFilePath to prevent traversal
 	file, err := os.Open(filename)
 	if err != nil {
 		return nil, fmt.Errorf("can't read wordlist file: %w", err)

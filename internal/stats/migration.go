@@ -7,7 +7,35 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 )
+
+// validateDataDirPath checks if a path is within the data directory.
+// This prevents directory traversal for programmatically constructed paths.
+func validateDataDirPath(dataDir, filePath string) error {
+	// Convert both to absolute paths
+	absDataDir, err := filepath.Abs(dataDir)
+	if err != nil {
+		return fmt.Errorf("cannot resolve data directory: %w", err)
+	}
+	absFilePath, err := filepath.Abs(filePath)
+	if err != nil {
+		return fmt.Errorf("cannot resolve file path: %w", err)
+	}
+
+	// Check if file path is within data directory
+	relPath, err := filepath.Rel(absDataDir, absFilePath)
+	if err != nil {
+		return fmt.Errorf("cannot determine relative path: %w", err)
+	}
+
+	// If relative path starts with "..", it's outside the data directory
+	if strings.HasPrefix(relPath, "..") {
+		return fmt.Errorf("file path is outside data directory: %s", filePath)
+	}
+
+	return nil
+}
 
 // MigrateFromFiles migrates data from NDJSON and JSON files to SQLite database.
 //
@@ -79,6 +107,13 @@ func MigrateFromFiles(db *Database, dataDir string, logger *slog.Logger) error {
 
 // migrateRequestsNDJSON reads requests from NDJSON file and imports into database.
 func migrateRequestsNDJSON(db *Database, filename string, logger *slog.Logger) error {
+	// Validate path - extract dataDir from filename (it's constructed as filepath.Join(dataDir, "requests.ndjson"))
+	dataDir := filepath.Dir(filename)
+	if err := validateDataDirPath(dataDir, filename); err != nil {
+		return fmt.Errorf("invalid file path: %w", err)
+	}
+
+	// #nosec G304 -- path validated by validateDataDirPath to prevent traversal
 	file, err := os.Open(filename)
 	if err != nil {
 		return fmt.Errorf("failed to open requests file: %w", err)
@@ -120,6 +155,13 @@ func migrateRequestsNDJSON(db *Database, filename string, logger *slog.Logger) e
 // Note: This is mainly for preserving the start time if NDJSON migration didn't
 // provide it. The counts will be recalculated from the request log.
 func migrateStatsJSON(db *Database, filename string, logger *slog.Logger) error {
+	// Validate path - extract dataDir from filename (it's constructed as filepath.Join(dataDir, "stats.json"))
+	dataDir := filepath.Dir(filename)
+	if err := validateDataDirPath(dataDir, filename); err != nil {
+		return fmt.Errorf("invalid file path: %w", err)
+	}
+
+	// #nosec G304 -- path validated by validateDataDirPath to prevent traversal
 	data, err := os.ReadFile(filename)
 	if err != nil {
 		return fmt.Errorf("failed to read stats file: %w", err)

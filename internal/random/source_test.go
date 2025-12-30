@@ -7,15 +7,12 @@ import (
 
 func TestNewSource(t *testing.T) {
 	charSet := "abc123"
-	seed := int64(12345)
+	seed := int64(12345) // Seed is ignored in crypto/rand implementation
 
 	src := NewSource(charSet, seed)
 
 	if src == nil {
 		t.Fatal("NewSource returned nil")
-	}
-	if src.rand == nil {
-		t.Error("rand field is nil")
 	}
 	if len(src.chars) != len(charSet) {
 		t.Errorf("chars length = %d, want %d", len(src.chars), len(charSet))
@@ -164,20 +161,27 @@ func TestConcurrentAccess(t *testing.T) {
 	wg.Wait()
 }
 
-func TestDeterministicBehavior(t *testing.T) {
-	// Same seed should produce same sequence
-	seed := int64(12345)
+func TestRandomnessDistribution(t *testing.T) {
+	// Test that crypto/rand produces values across the range
+	// (Not deterministic like math/rand with seed)
 	charSet := "abc"
+	src := NewSource(charSet, 0) // Seed ignored with crypto/rand
 
-	src1 := NewSource(charSet, seed)
-	src2 := NewSource(charSet, seed)
+	// Generate multiple values and check distribution
+	counts := make(map[int]int)
+	iterations := 1000
 
-	for i := 0; i < 10; i++ {
-		val1 := src1.Intn(100)
-		val2 := src2.Intn(100)
-		if val1 != val2 {
-			t.Errorf("iteration %d: src1.Intn(100) = %d, src2.Intn(100) = %d, want same value", i, val1, val2)
+	for i := 0; i < iterations; i++ {
+		val := src.Intn(10)
+		if val < 0 || val >= 10 {
+			t.Errorf("Intn(10) = %d, want value in range [0, 10)", val)
 		}
+		counts[val]++
+	}
+
+	// Verify we got some distribution (not all the same value)
+	if len(counts) < 5 {
+		t.Errorf("Distribution too narrow: got %d unique values in %d iterations", len(counts), iterations)
 	}
 }
 

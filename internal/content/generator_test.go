@@ -256,22 +256,35 @@ func TestWriteForm(t *testing.T) {
 	}
 }
 
-func TestConsistencyWithSameSeed(t *testing.T) {
+func TestMultipleGenerations(t *testing.T) {
+	// Test that crypto/rand produces valid but different pages each time
+	// (Not deterministic like math/rand with seed)
 	webpages := []string{"page1", "page2"}
 	template := `<a href="/old">link</a>`
-	seed := int64(12345)
 
-	src1 := random.NewSource("abc", seed)
-	gen1 := NewGenerator(webpages, template, "", src1)
+	src := random.NewSource("abc", 0) // Seed ignored with crypto/rand
+	gen := NewGenerator(webpages, template, "", src)
 
-	src2 := random.NewSource("abc", seed)
-	gen2 := NewGenerator(webpages, template, "", src2)
+	// Generate multiple pages
+	pages := make(map[string]bool)
+	for i := 0; i < 10; i++ {
+		page := gen.GeneratePage()
 
-	page1 := gen1.GeneratePage()
-	page2 := gen2.GeneratePage()
+		// Basic validation
+		if page == "" {
+			t.Error("GeneratePage returned empty string")
+		}
+		if !strings.Contains(page, "href=") {
+			t.Error("GeneratePage missing href attribute")
+		}
 
-	if page1 != page2 {
-		t.Error("Same seed should produce same page")
+		pages[page] = true
+	}
+
+	// With crypto/rand, we should get some variety (not all identical)
+	// Though it's possible (unlikely) all could be the same with small webpage list
+	if len(pages) < 2 {
+		t.Logf("Warning: Got %d unique pages out of 10 generations (expected more variety with crypto/rand)", len(pages))
 	}
 }
 

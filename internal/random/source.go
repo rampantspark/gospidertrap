@@ -1,43 +1,62 @@
-// Package random provides thread-safe random number generation.
+// Package random provides thread-safe cryptographically secure random number generation.
 package random
 
 import (
-	"math/rand"
+	"crypto/rand"
+	"encoding/binary"
 	"sync"
 )
 
-// Source provides thread-safe random number generation with a specific character set.
+// Source provides thread-safe cryptographically secure random number generation with a specific character set.
 type Source struct {
-	rand  *rand.Rand
 	mu    sync.Mutex
 	chars []rune
 }
 
-// NewSource creates a new random source with the given character set and seed.
+// NewSource creates a new random source with the given character set.
+//
+// Note: The seed parameter is ignored as crypto/rand is used for cryptographic security.
+// It's kept for backward compatibility.
 //
 // Parameters:
 //   - charSet: the character set to use for string generation
-//   - seed: the seed for the random number generator
+//   - seed: ignored (kept for backward compatibility)
 //
 // Returns a new Source instance.
 func NewSource(charSet string, seed int64) *Source {
 	return &Source{
-		rand:  rand.New(rand.NewSource(seed)),
 		chars: []rune(charSet),
 	}
 }
 
-// Intn returns a random integer in [0, n) using thread-safe access to the
-// random number generator.
+// Intn returns a cryptographically secure random integer in [0, n).
 //
 // Parameters:
 //   - n: the upper bound (exclusive)
 //
 // Returns a random integer in [0, n).
 func (s *Source) Intn(n int) int {
+	if n <= 0 {
+		panic("invalid argument to Intn")
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.rand.Intn(n)
+
+	// Use crypto/rand to generate random bytes
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic(err) // crypto/rand.Read should never fail
+	}
+
+	// Convert bytes to uint64
+	val := binary.BigEndian.Uint64(b[:])
+
+	// Modulo ensures result is in range [0, n)
+	// Since we validated n > 0 and result < n, conversion to int is safe
+	// #nosec G115 -- modulo result is always less than n, which fits in int
+	result := int(val % uint64(n))
+	return result
 }
 
 // RandomInt returns a random integer in the inclusive range [min, max].
@@ -53,15 +72,13 @@ func (s *Source) RandomInt(min, max int) int {
 	return s.Intn(max-min+1) + min
 }
 
-// RandString generates a random string of the specified length.
+// RandString generates a cryptographically secure random string of the specified length.
 //
 // The string is composed of characters randomly selected from the configured
 // character set. Each character has an equal probability of being selected.
 //
-// NOTE: This uses math/rand and is NOT cryptographically secure.
-// For security-sensitive random generation, use crypto/rand directly.
-//
-// Uses thread-safe random number generation to prevent race conditions.
+// Uses crypto/rand for cryptographically secure random generation.
+// Thread-safe for concurrent use.
 //
 // Parameters:
 //   - length: the desired length of the generated string
