@@ -1,4 +1,4 @@
-name: Build and Release
+name: CD
 
 on:
   push:
@@ -9,6 +9,8 @@ on:
 jobs:
   version:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write  # Required to create tags and push to repository
     outputs:
       new_tag: ${{ steps.bump_version.outputs.new_tag }}
       changelog: ${{ steps.bump_version.outputs.changelog }}

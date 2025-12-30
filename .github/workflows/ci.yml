@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - '**'  # Run on all branches
+      - '!main'  # Exclude main branch (main runs CD workflow)
   pull_request:
     branches:
       - '**'  # Run on all pull requests
