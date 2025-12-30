@@ -36,6 +36,7 @@ func NewRenderer(adminPath string) *Renderer {
 //   - uniqueUAs: number of unique user agents
 //   - recentRequests: slice of recent request entries
 //   - maxDisplay: maximum number of recent requests to display
+//   - nonce: CSP nonce for inline scripts (empty string if not using nonces)
 //
 // Returns the complete HTML as a string.
 func (r *Renderer) RenderAdminUI(
@@ -44,6 +45,7 @@ func (r *Renderer) RenderAdminUI(
 	totalRequests, uniqueIPs, uniqueUAs int,
 	recentRequests []stats.RequestInfo,
 	maxDisplay int,
+	nonce string,
 ) string {
 	var sb strings.Builder
 
@@ -52,7 +54,7 @@ func (r *Renderer) RenderAdminUI(
 	r.writeTopIPsSection(&sb, chartData)
 	r.writeTopUAsSection(&sb, chartData)
 	r.writeRecentRequestsSection(&sb, recentRequests, maxDisplay)
-	r.writeChartScript(&sb)
+	r.writeChartScript(&sb, nonce)
 	sb.WriteString("</body>\n</html>")
 
 	return sb.String()
@@ -185,8 +187,17 @@ func (r *Renderer) writeRecentRequestsSection(sb *strings.Builder, recentRequest
 }
 
 // writeChartScript writes the JavaScript code for loading and rendering charts.
-func (r *Renderer) writeChartScript(sb *strings.Builder) {
-	sb.WriteString("<script>\n")
+//
+// Parameters:
+//   - nonce: CSP nonce for inline script (empty string if not using nonces)
+func (r *Renderer) writeChartScript(sb *strings.Builder, nonce string) {
+	sb.WriteString("<script")
+	if nonce != "" {
+		sb.WriteString(" nonce=\"")
+		sb.WriteString(html.EscapeString(nonce))
+		sb.WriteString("\"")
+	}
+	sb.WriteString(">\n")
 	sb.WriteString("const baseDataUrl = '")
 	sb.WriteString(html.EscapeString(r.adminPath))
 	sb.WriteString("/data';\n")

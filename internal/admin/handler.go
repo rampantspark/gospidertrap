@@ -1,6 +1,8 @@
 package admin
 
 import (
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"html"
 	"io"
@@ -60,8 +62,8 @@ func (h *Handler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 			"path", r.URL.Path,
 			"user_agent", r.Header.Get("User-Agent"))
 
-		// Set security headers
-		h.setSecurityHeaders(w)
+		// Set security headers (no nonce needed for static error page)
+		h.setSecurityHeaders(w, "")
 		w.WriteHeader(http.StatusForbidden)
 		w.Header().Set("Content-Type", "text/html")
 		io.WriteString(w, "<!DOCTYPE html>\n<html>\n<head><title>Access Denied</title></head>\n<body>\n<h1>403 Forbidden</h1>\n<p>Invalid or missing authentication token.</p>\n</body>\n</html>")
@@ -93,8 +95,8 @@ func (h *Handler) HandleChartData(w http.ResponseWriter, r *http.Request) {
 
 	// Validate authentication
 	if !h.auth.IsAuthenticated(r) {
-		// Set security headers
-		h.setSecurityHeaders(w)
+		// Set security headers (no nonce needed for JSON response)
+		h.setSecurityHeaders(w, "")
 		w.WriteHeader(http.StatusForbidden)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid or missing authentication token"})
 		return
@@ -108,8 +110,8 @@ func (h *Handler) HandleChartData(w http.ResponseWriter, r *http.Request) {
 	// Get chart data from stats manager, passing context for cancellation support
 	data := h.statsManager.GetChartData(ctx, 10, 50) // top 10 items, max 50 char user agents
 
-	// Set security headers
-	h.setSecurityHeaders(w)
+	// Set security headers (no nonce needed for JSON response)
+	h.setSecurityHeaders(w, "")
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(data)
 }
@@ -157,7 +159,10 @@ func (h *Handler) HandleUI(w http.ResponseWriter, r *http.Request) {
 	uptime, totalRequests, uniqueIPs, uniqueUAs := h.statsManager.GetStats(ctx)
 	recentRequests := h.statsManager.GetRecentRequests(ctx, 50) // max 50 recent requests
 
-	// Render HTML
+	// Generate a nonce for inline scripts (CSP security)
+	nonce := h.generateNonce()
+
+	// Render HTML with nonce
 	html := h.renderer.RenderAdminUI(
 		chartData,
 		uptime,
@@ -165,27 +170,50 @@ func (h *Handler) HandleUI(w http.ResponseWriter, r *http.Request) {
 		uniqueIPs,
 		uniqueUAs,
 		recentRequests,
-		50, // max display
+		50,    // max display
+		nonce, // CSP nonce for inline scripts
 	)
 
 	// Set security headers before sending response
-	h.setSecurityHeaders(w)
+	h.setSecurityHeaders(w, nonce)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	io.WriteString(w, html)
+}
+
+// generateNonce generates a cryptographically secure nonce for CSP.
+//
+// Returns a base64-encoded random nonce string suitable for CSP directives.
+func (h *Handler) generateNonce() string {
+	// 16 bytes gives us 128 bits of entropy, encoded to 24 base64 characters
+	nonceBytes := make([]byte, 16)
+	if _, err := rand.Read(nonceBytes); err != nil {
+		// If we can't generate a secure nonce, log the error and use a fallback
+		// This should never happen in practice with a properly functioning system
+		h.logger.Error("Failed to generate CSP nonce", "error", err)
+		return ""
+	}
+	return base64.StdEncoding.EncodeToString(nonceBytes)
 }
 
 // setSecurityHeaders sets security headers for admin UI responses.
 //
 // This includes CSP headers to prevent XSS attacks and other security headers
-// to harden the admin interface.
-func (h *Handler) setSecurityHeaders(w http.ResponseWriter) {
+// to harden the admin interface. A nonce can be provided for inline script execution.
+func (h *Handler) setSecurityHeaders(w http.ResponseWriter, nonce string) {
+	// Build script-src directive with nonce if available
+	scriptSrc := "script-src 'self' https://cdn.jsdelivr.net"
+	if nonce != "" {
+		scriptSrc += " 'nonce-" + nonce + "'"
+	}
+
 	// Content Security Policy - restrict resource loading
+	// Allow cdn.jsdelivr.net for both script loading and source map connections
 	w.Header().Set("Content-Security-Policy",
 		"default-src 'self'; "+
-			"script-src 'self' https://cdn.jsdelivr.net; "+
+			scriptSrc+"; "+
 			"style-src 'self' 'unsafe-inline'; "+
 			"img-src 'self' data:; "+
-			"connect-src 'self'; "+
+			"connect-src 'self' https://cdn.jsdelivr.net; "+
 			"frame-ancestors 'none'")
 
 	// Prevent page from being displayed in iframe (clickjacking protection)
