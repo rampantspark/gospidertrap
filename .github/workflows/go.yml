@@ -48,7 +48,7 @@ jobs:
 
     steps:
     - name: Download builds
-      uses: actions/download-artifact@v2
+      uses: actions/download-artifact@v7
       with:
         name: myapp-builds
 
