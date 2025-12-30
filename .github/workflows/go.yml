@@ -34,7 +34,7 @@ jobs:
       run: GOOS=linux GOARCH=amd64 go build -o myapp_linux_amd64
 
     - name: Archive builds
-      uses: actions/upload-artifact@v2
+      uses: actions/upload-artifact@v6
       with:
         name: myapp-builds
         path: |
