@@ -513,7 +513,8 @@ func main() {
 
 		// Run migration from files if they exist
 		if cfg.dataDir != "" {
-			if err := stats.MigrateFromFiles(db, cfg.dataDir, cfg.logger); err != nil {
+			// Use background context for migration as it should complete even if startup is slow
+			if err := stats.MigrateFromFiles(context.Background(), db, cfg.dataDir, cfg.logger); err != nil {
 				// Not a critical error, just log it
 				cfg.logger.Debug("Migration from files failed", "error", err)
 			}

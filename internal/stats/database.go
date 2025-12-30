@@ -1,6 +1,7 @@
 package stats
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log/slog"
@@ -132,21 +133,22 @@ func NewDatabase(dbPath string, logger *slog.Logger) (*Database, error) {
 // Uses a transaction to ensure atomic updates.
 //
 // Parameters:
+//   - ctx: context for cancellation and timeout control
 //   - req: the request information to record
 //
-// Returns an error if the database operation fails.
-func (d *Database) RecordRequest(req RequestInfo) error {
+// Returns an error if the database operation fails or context is cancelled.
+func (d *Database) RecordRequest(ctx context.Context, req RequestInfo) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	tx, err := d.db.Begin()
+	tx, err := d.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback()
 
 	// Insert request log entry
-	_, err = tx.Exec(`
+	_, err = tx.ExecContext(ctx, `
 		INSERT INTO request_log (ip, user_agent, path, timestamp)
 		VALUES (?, ?, ?, ?)
 	`, req.IP, req.UserAgent, req.Path, req.Timestamp)
@@ -155,7 +157,7 @@ func (d *Database) RecordRequest(req RequestInfo) error {
 	}
 
 	// Update IP count
-	_, err = tx.Exec(`
+	_, err = tx.ExecContext(ctx, `
 		INSERT INTO ip_counts (ip, count, first_seen, last_seen)
 		VALUES (?, 1, ?, ?)
 		ON CONFLICT(ip) DO UPDATE SET
@@ -167,7 +169,7 @@ func (d *Database) RecordRequest(req RequestInfo) error {
 	}
 
 	// Update user agent count
-	_, err = tx.Exec(`
+	_, err = tx.ExecContext(ctx, `
 		INSERT INTO user_agent_counts (user_agent, count, first_seen, last_seen)
 		VALUES (?, 1, ?, ?)
 		ON CONFLICT(user_agent) DO UPDATE SET
@@ -179,7 +181,7 @@ func (d *Database) RecordRequest(req RequestInfo) error {
 	}
 
 	// Increment total requests
-	_, err = tx.Exec(`
+	_, err = tx.ExecContext(ctx, `
 		UPDATE stats
 		SET total_requests = total_requests + 1,
 		    updated_at = ?
@@ -198,8 +200,11 @@ func (d *Database) RecordRequest(req RequestInfo) error {
 
 // GetStats retrieves the current statistics.
 //
+// Parameters:
+//   - ctx: context for cancellation and timeout control
+//
 // Returns the Stats instance populated from the database.
-func (d *Database) GetStats() (*Stats, error) {
+func (d *Database) GetStats(ctx context.Context) (*Stats, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
@@ -209,7 +214,7 @@ func (d *Database) GetStats() (*Stats, error) {
 	}
 
 	// Get start time and total requests
-	err := d.db.QueryRow(`
+	err := d.db.QueryRowContext(ctx, `
 		SELECT start_time, total_requests
 		FROM stats
 		WHERE id = 1
@@ -219,7 +224,7 @@ func (d *Database) GetStats() (*Stats, error) {
 	}
 
 	// Get IP counts
-	rows, err := d.db.Query(`SELECT ip, count FROM ip_counts`)
+	rows, err := d.db.QueryContext(ctx, `SELECT ip, count FROM ip_counts`)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query IP counts: %w", err)
 	}
@@ -238,7 +243,7 @@ func (d *Database) GetStats() (*Stats, error) {
 	}
 
 	// Get user agent counts
-	rows, err = d.db.Query(`SELECT user_agent, count FROM user_agent_counts`)
+	rows, err = d.db.QueryContext(ctx, `SELECT user_agent, count FROM user_agent_counts`)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query user agent counts: %w", err)
 	}
@@ -257,7 +262,7 @@ func (d *Database) GetStats() (*Stats, error) {
 	}
 
 	// Get recent requests
-	recentRequests, err := d.GetRecentRequests(100)
+	recentRequests, err := d.GetRecentRequests(ctx, 100)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get recent requests: %w", err)
 	}
@@ -270,14 +275,15 @@ func (d *Database) GetStats() (*Stats, error) {
 // GetRecentRequests retrieves the most recent N requests from the database.
 //
 // Parameters:
+//   - ctx: context for cancellation and timeout control
 //   - limit: maximum number of requests to retrieve
 //
 // Returns a slice of RequestInfo ordered by timestamp (most recent first).
-func (d *Database) GetRecentRequests(limit int) ([]RequestInfo, error) {
+func (d *Database) GetRecentRequests(ctx context.Context, limit int) ([]RequestInfo, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	rows, err := d.db.Query(`
+	rows, err := d.db.QueryContext(ctx, `
 		SELECT ip, user_agent, path, timestamp
 		FROM request_log
 		ORDER BY timestamp DESC
@@ -306,14 +312,15 @@ func (d *Database) GetRecentRequests(limit int) ([]RequestInfo, error) {
 // GetTopIPs retrieves the top N IP addresses by request count.
 //
 // Parameters:
+//   - ctx: context for cancellation and timeout control
 //   - limit: maximum number of IPs to retrieve
 //
 // Returns a slice of CountEntry ordered by count (highest first).
-func (d *Database) GetTopIPs(limit int) ([]CountEntry, error) {
+func (d *Database) GetTopIPs(ctx context.Context, limit int) ([]CountEntry, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	rows, err := d.db.Query(`
+	rows, err := d.db.QueryContext(ctx, `
 		SELECT ip, count
 		FROM ip_counts
 		ORDER BY count DESC
@@ -342,14 +349,15 @@ func (d *Database) GetTopIPs(limit int) ([]CountEntry, error) {
 // GetTopUserAgents retrieves the top N user agents by request count.
 //
 // Parameters:
+//   - ctx: context for cancellation and timeout control
 //   - limit: maximum number of user agents to retrieve
 //
 // Returns a slice of CountEntry ordered by count (highest first).
-func (d *Database) GetTopUserAgents(limit int) ([]CountEntry, error) {
+func (d *Database) GetTopUserAgents(ctx context.Context, limit int) ([]CountEntry, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	rows, err := d.db.Query(`
+	rows, err := d.db.QueryContext(ctx, `
 		SELECT user_agent, count
 		FROM user_agent_counts
 		ORDER BY count DESC

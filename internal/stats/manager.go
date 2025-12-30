@@ -1,6 +1,7 @@
 package stats
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 	"time"
@@ -40,10 +41,11 @@ func NewManager(db *Database, stats *Stats, trustProxy bool, logger *slog.Logger
 // Uses database if configured, otherwise falls back to in-memory stats.
 //
 // Parameters:
+//   - ctx: context for cancellation and timeout control
 //   - r: the HTTP request
 //
 // Returns an error if database recording fails (file mode never returns error).
-func (m *Manager) RecordRequest(r *http.Request) error {
+func (m *Manager) RecordRequest(ctx context.Context, r *http.Request) error {
 	ip := m.ipResolver.GetClientIP(r)
 	userAgent := r.Header.Get("User-Agent")
 	if userAgent == "" {
@@ -61,7 +63,7 @@ func (m *Manager) RecordRequest(r *http.Request) error {
 
 	// Use database if configured
 	if m.db != nil {
-		if err := m.db.RecordRequest(reqInfo); err != nil {
+		if err := m.db.RecordRequest(ctx, reqInfo); err != nil {
 			m.logger.Warn("Failed to record request in database", "error", err)
 			return err
 		}
@@ -103,22 +105,23 @@ func (m *Manager) RecordRequest(r *http.Request) error {
 // GetChartData retrieves chart data for the admin UI.
 //
 // Parameters:
+//   - ctx: context for cancellation and timeout control
 //   - topItemsCount: number of top items to retrieve
 //   - maxUserAgentLength: maximum length of user agent strings
 //
 // Returns chart data including top IPs and top user agents.
-func (m *Manager) GetChartData(topItemsCount, maxUserAgentLength int) ChartData {
+func (m *Manager) GetChartData(ctx context.Context, topItemsCount, maxUserAgentLength int) ChartData {
 	var data ChartData
 
 	// Use database if configured
 	if m.db != nil {
-		topIPs, err := m.db.GetTopIPs(topItemsCount)
+		topIPs, err := m.db.GetTopIPs(ctx, topItemsCount)
 		if err != nil {
 			m.logger.Warn("Failed to get top IPs from database", "error", err)
 			return data
 		}
 
-		topUAs, err := m.db.GetTopUserAgents(topItemsCount)
+		topUAs, err := m.db.GetTopUserAgents(ctx, topItemsCount)
 		if err != nil {
 			m.logger.Warn("Failed to get top user agents from database", "error", err)
 			return data
@@ -217,14 +220,17 @@ func (m *Manager) getChartDataFromMemory(topItemsCount, maxUserAgentLength int) 
 
 // GetStats retrieves current statistics.
 //
+// Parameters:
+//   - ctx: context for cancellation and timeout control
+//
 // Returns:
 //   - uptime: server uptime duration
 //   - totalRequests: total number of requests
 //   - uniqueIPs: number of unique IP addresses
 //   - uniqueUAs: number of unique user agents
-func (m *Manager) GetStats() (uptime time.Duration, totalRequests, uniqueIPs, uniqueUAs int) {
+func (m *Manager) GetStats(ctx context.Context) (uptime time.Duration, totalRequests, uniqueIPs, uniqueUAs int) {
 	if m.db != nil {
-		dbStats, err := m.db.GetStats()
+		dbStats, err := m.db.GetStats(ctx)
 		if err != nil {
 			m.logger.Warn("Failed to get stats from database", "error", err)
 			return 0, 0, 0, 0
@@ -242,13 +248,14 @@ func (m *Manager) GetStats() (uptime time.Duration, totalRequests, uniqueIPs, un
 // GetRecentRequests retrieves recent request log entries.
 //
 // Parameters:
+//   - ctx: context for cancellation and timeout control
 //   - limit: maximum number of requests to retrieve
 //
 // Returns a slice of RequestInfo ordered by timestamp (most recent first).
-func (m *Manager) GetRecentRequests(limit int) []RequestInfo {
+func (m *Manager) GetRecentRequests(ctx context.Context, limit int) []RequestInfo {
 	if m.db != nil {
 		// Database mode: already returns DESC order (most recent first)
-		requests, err := m.db.GetRecentRequests(limit)
+		requests, err := m.db.GetRecentRequests(ctx, limit)
 		if err != nil {
 			m.logger.Warn("Failed to get recent requests from database", "error", err)
 			return nil

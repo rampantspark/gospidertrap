@@ -55,8 +55,8 @@ func New(content *content.Generator, stats *stats.Manager, logger *slog.Logger, 
 func (h *RequestHandler) Handle(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	// Record request statistics
-	if err := h.stats.RecordRequest(r); err != nil {
+	// Record request statistics, passing context for cancellation support
+	if err := h.stats.RecordRequest(ctx, r); err != nil {
 		h.logger.Warn("Failed to record request", "error", err)
 	}
 
