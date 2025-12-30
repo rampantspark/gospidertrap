@@ -1,1 +1,71 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+gospidertrap
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+coverage.html
+coverage.out
+
+# Dependency directories
+vendor/
+
+# Go workspace file
+go.work
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Data directory (SQLite databases and logs)
 data/
+*.db
+*.db-shm
+*.db-wal
+
+# Backup files
+*.backup
+*.bak
+*.old
+*.orig
+
+# Logs
+*.log
+*.ndjson
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# OS specific
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Build artifacts
+dist/
+build/
+bin/
+
+# Air (live reload tool) temp directory
+tmp/
+
+# Testing
+testdata/output/

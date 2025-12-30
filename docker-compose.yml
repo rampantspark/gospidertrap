@@ -1,0 +1,64 @@
+version: '3.8'
+
+services:
+  gospidertrap:
+    build: .
+    image: gospidertrap:latest
+    container_name: gospidertrap
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      # Persist database and logs
+      - ./data:/app/data
+      # Optional: mount wordlist
+      # - ./wordlist.txt:/app/wordlist.txt:ro
+      # Optional: mount HTML template
+      # - ./template.html:/app/template.html:ro
+    environment:
+      # Server configuration
+      - PORT=8000
+      - DATA_DIR=/app/data
+
+      # Rate limiting
+      - RATE_LIMIT=10
+      - RATE_BURST=20
+
+      # Optional: Enable HTTPS mode (if behind reverse proxy)
+      # - HTTPS=true
+
+      # Optional: Trust proxy headers (if behind reverse proxy)
+      # - TRUST_PROXY=true
+
+    # Command line arguments (override CMD in Dockerfile)
+    # Uncomment and modify as needed
+    # command: ["-p", "8000", "-w", "/app/wordlist.txt", "-d", "/app/data"]
+
+    networks:
+      - gospidertrap-network
+
+    # Resource limits (optional but recommended)
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+        reservations:
+          cpus: '0.1'
+          memory: 64M
+
+networks:
+  gospidertrap-network:
+    driver: bridge
+
+# Optional: If you want to use with a reverse proxy (e.g., nginx, traefik)
+# Uncomment the section below and configure accordingly
+
+# Example with Traefik labels:
+#   gospidertrap:
+#     labels:
+#       - "traefik.enable=true"
+#       - "traefik.http.routers.gospidertrap.rule=Host(`spider.example.com`)"
+#       - "traefik.http.routers.gospidertrap.entrypoints=websecure"
+#       - "traefik.http.routers.gospidertrap.tls.certresolver=letsencrypt"
+#       - "traefik.http.services.gospidertrap.loadbalancer.server.port=8000"

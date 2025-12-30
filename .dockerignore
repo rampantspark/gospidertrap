@@ -1,0 +1,44 @@
+# Ignore build artifacts
+gospidertrap
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Ignore test and coverage files
+*.test
+*.out
+*.prof
+
+# Ignore data directory (will be created in container)
+data/
+
+# Ignore Git files
+.git
+.gitignore
+
+# Ignore IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Ignore documentation
+*.md
+docs/
+
+# Ignore CI/CD files
+.github/
+.gitlab-ci.yml
+
+# Ignore Docker files (we're building with them, not copying them in)
+Dockerfile
+.dockerignore
+docker-compose.yml
+
+# Ignore temporary files
+tmp/
+temp/
+*.tmp

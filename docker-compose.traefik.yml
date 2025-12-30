@@ -1,0 +1,80 @@
+version: '3.8'
+
+# Example: Running gospidertrap behind Traefik reverse proxy
+# This assumes you have Traefik already running with Let's Encrypt configured
+
+services:
+  gospidertrap:
+    build: .
+    image: gospidertrap:latest
+    container_name: gospidertrap
+    restart: unless-stopped
+
+    # Don't expose port directly - Traefik will handle it
+    expose:
+      - "8000"
+
+    volumes:
+      - ./data:/app/data
+
+    environment:
+      - PORT=8000
+      - DATA_DIR=/app/data
+      - RATE_LIMIT=50
+      - RATE_BURST=100
+      # Enable HTTPS mode since we're behind HTTPS proxy
+      - HTTPS=true
+      # Trust proxy headers
+      - TRUST_PROXY=true
+
+    networks:
+      - traefik-public
+
+    labels:
+      # Enable Traefik
+      - "traefik.enable=true"
+
+      # Define the network
+      - "traefik.docker.network=traefik-public"
+
+      # HTTP router (redirect to HTTPS)
+      - "traefik.http.routers.gospidertrap-http.rule=Host(`spider.example.com`)"
+      - "traefik.http.routers.gospidertrap-http.entrypoints=web"
+      - "traefik.http.routers.gospidertrap-http.middlewares=redirect-to-https"
+
+      # HTTPS router
+      - "traefik.http.routers.gospidertrap.rule=Host(`spider.example.com`)"
+      - "traefik.http.routers.gospidertrap.entrypoints=websecure"
+      - "traefik.http.routers.gospidertrap.tls=true"
+      - "traefik.http.routers.gospidertrap.tls.certresolver=letsencrypt"
+
+      # Service configuration
+      - "traefik.http.services.gospidertrap.loadbalancer.server.port=8000"
+
+      # Middleware for HTTPS redirect
+      - "traefik.http.middlewares.redirect-to-https.redirectscheme.scheme=https"
+      - "traefik.http.middlewares.redirect-to-https.redirectscheme.permanent=true"
+
+      # Optional: Add rate limiting middleware (in addition to gospidertrap's internal limiting)
+      # - "traefik.http.routers.gospidertrap.middlewares=rate-limit"
+      # - "traefik.http.middlewares.rate-limit.ratelimit.average=100"
+      # - "traefik.http.middlewares.rate-limit.ratelimit.burst=50"
+
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 128M
+
+networks:
+  traefik-public:
+    external: true
+
+# To use this file:
+# 1. Update spider.example.com to your actual domain
+# 2. Ensure Traefik is running with the traefik-public network
+# 3. Run: docker-compose -f docker-compose.traefik.yml up -d
